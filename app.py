@@ -388,6 +388,8 @@ def get_latest_rtdb_sensor_data():
 # ... (rest of your imports) ...
 
 # New route to handle serving the QR scanner page
+# app.py
+
 @app.route('/qr_scanner')
 def qr_scanner_page():
     """
@@ -396,36 +398,47 @@ def qr_scanner_page():
     """
     token = request.args.get('token')
     field_id = request.args.get('fieldId')
-    user_uid = None
+    user_uid = 'missing_uid' # Default value if auth fails
+    
+    if token and firebase_admin:
+        try:
+            # Verify the ID token passed from the frontend securely on the backend
+            decoded_token = auth.verify_id_token(token)
+            user_uid = decoded_token['uid'] # THIS IS THE UID WE WANT TO SAVE
+            logger.info(f"QR Scanner requested by verified user: {user_uid}")
+        except Exception as e:
+            logger.error(f"Invalid token received for QR scanner: {e}")
+            user_uid = 'UNAUTHORIZED' 
+
+    if not field_id:
+        field_id = 'missing_field'
+    
+    # CRITICAL: Render the template with the *verified UID*
+    return render_template('qr_scanner.html', user_uid=user_uid, field_id=field_id)
+
+# ... (rest of your app.py file) ...
+# app.py (Add this new route)
+
+# app.py (Modified)
+
+@app.route('/live_tracker')
+def live_tracker_page():
+    """Renders the Live Location Tracker page, securely passing user context."""
+    token = request.args.get('token') # Expect the token here
+    user_uid = 'missing_uid'
     
     if token and firebase_admin:
         try:
             # Verify the ID token passed from the frontend securely on the backend
             decoded_token = auth.verify_id_token(token)
             user_uid = decoded_token['uid']
-            logger.info(f"QR Scanner requested by verified user: {user_uid}")
+            logger.info(f"Live Tracker requested by verified user: {user_uid}")
         except Exception as e:
-            logger.error(f"Invalid token received for QR scanner: {e}")
-            # Do not allow access if the token is invalid
+            logger.error(f"Invalid token received for Live Tracker: {e}")
             user_uid = 'UNAUTHORIZED' 
 
-    if not user_uid or not field_id:
-        # Render the template anyway, but the frontend script will block/show error
-        user_uid = user_uid or 'missing_uid'
-        field_id = field_id or 'missing_field'
-
-    return render_template('qr_scanner.html', user_uid=user_uid, field_id=field_id)
-
-
-# ... (rest of your app.py file) ...
-# app.py (Add this new route)
-
-@app.route('/live_tracker')
-def live_tracker_page():
-    """Serve the Leaflet-based Live Location Tracker page."""
-    # NOTE: You must ensure 'live_tracker.html' is placed inside your 'templates' folder
-    # for render_template to find it.
-    return render_template('live_tracker.html')
+    # CRITICAL: Pass the user_uid so JavaScript can use it
+    return render_template('live_tracker.html', user_uid=user_uid)
 
 # CRITICAL UPDATE: Fetch history data based on the userId passed from the frontend
 @app.route('/api/rtdb/sensor-data/history')
@@ -590,6 +603,124 @@ def get_user_field():
         logger.error(f"Error fetching user field: {e}")
         return jsonify({"error": "Internal server error"}), 500
 
+
+
+# app.py
+
+# app.py
+
+@app.route('/api/user_scans/<string:user_id>')
+def get_user_scans(user_id):
+    """
+    Fetches all probes from the new centralized 'scans' collection for the user.
+    (Used by mobile.js to display markers on the home map)
+    """
+    if not firestore:
+        return jsonify({"error": "Firebase not initialized"}), 500
+    
+    try:
+        db = firestore.client()
+        scans_ref = db.collection('scans')
+        # Query: /scans where user_id == {user_id}
+        query = scans_ref.where('user_id', '==', user_id).order_by('timestamp', direction=firestore.Query.DESCENDING)
+        
+        docs = query.stream()
+        scans = []
+        for doc in docs:
+            scan_data = doc.to_dict()
+            
+            # CRITICAL: Attempt to use the GeoPoint 'location' first, fall back to string/number lat/lng
+            latitude = scan_data.get('latitude')
+            longitude = scan_data.get('longitude')
+
+            if scan_data.get('location') and hasattr(scan_data['location'], 'latitude'):
+                latitude = scan_data['location'].latitude
+                longitude = scan_data['location'].longitude
+            
+            # Ensure they are present for the frontend
+            if latitude is None or longitude is None:
+                continue
+
+            scan_data['latitude'] = float(latitude)
+            scan_data['longitude'] = float(longitude)
+            
+            # Convert Firestore Timestamp object to ISO string for JavaScript
+            if hasattr(scan_data.get('timestamp'), 'isoformat'):
+                scan_data['timestamp'] = scan_data['timestamp'].isoformat()
+            
+            if 'latitude' in scan_data and 'longitude' in scan_data:
+                 scans.append(scan_data)
+        
+        logger.info(f"Fetched {len(scans)} scans from /scans for user {user_id}")
+        return jsonify({"scans": scans})
+
+    except Exception as e:
+        logger.error(f"Error fetching scans for user {user_id} from /scans: {e}")
+        return jsonify({"error": "Internal server error"}), 500
+    
+# app.py (Add this function to the end of your app.py file)
+
+# app.py
+
+# ... (Previous code remains the same up to get_live_probes) ...
+
+@app.route('/api/live_probes/<string:user_id>')
+def get_live_probes(user_id):
+    """
+    Fetches all probes from the new centralized 'scans' collection for persistent 
+    display on the Live Tracker map.
+    """
+    if not firestore:
+        return jsonify({"error": "Firebase not initialized"}), 500
+    
+    try:
+        db = firestore.client()
+        
+        # *** Query the centralized 'scans' collection ***
+        scans_ref = db.collection('scans')
+        query = scans_ref.where('user_id', '==', user_id) 
+        
+        docs = query.stream()
+        probes = []
+        for doc in docs:
+            probe_data = doc.to_dict()
+            
+            # Use the 'latitude' and 'longitude' fields which are saved as strings/numbers
+            lat_raw = probe_data.get('latitude')
+            lng_raw = probe_data.get('longitude')
+            
+            # CRITICAL: Attempt to use the GeoPoint 'location' first
+            if probe_data.get('location') and hasattr(probe_data['location'], 'latitude'):
+                lat_raw = probe_data['location'].latitude
+                lng_raw = probe_data['location'].longitude
+            
+            # CRITICAL FIX: Robustly convert to float, return if impossible
+            try:
+                lat = float(lat_raw)
+                lng = float(lng_raw)
+            except (ValueError, TypeError):
+                # If conversion fails (e.g., data is missing or bad), skip this document
+                continue
+
+            # Prepare the final response structure
+            probes.append({
+                'probe_id': probe_data.get('probe_id'),
+                'lat': lat,  # Now guaranteed to be float
+                'lng': lng,  # Now guaranteed to be float
+                'plantedAt': (probe_data.get('timestamp') or datetime.now()).isoformat()
+            })
+        
+        logger.info(f"Fetched {len(probes)} permanent zones from /scans for user {user_id}")
+        # CRITICAL DEBUG CHECK: Ensure the response contains an array of probes
+        return jsonify({"probes": probes})
+
+    except Exception as e:
+        logger.error(f"Error fetching live probes for user {user_id} from /scans: {e}")
+        return jsonify({"error": "Internal server error"}), 500
+
+# ... (Rest of app.py remains the same) ...
+
+    
 @app.route('/api/market-trends')
 def get_market_trends():
     """Get market trends from Agmarknet API"""
@@ -754,36 +885,38 @@ def process_new_sensor_reading(reading_data):
         
 @app.route('/api/fields')
 def get_user_fields():
-    """Get all fields for the authenticated user"""
+    """
+    Get all fields for the authenticated user, or the user specified in query params.
+    Live Tracker uses query param: /api/fields?userId={uid}
+    """
     try:
         if not firestore or not firebase_admin:
             return jsonify({"error": "Firebase not initialized"}), 500
         
-        # 1. Get and check Authorization header
-        auth_header = request.headers.get('Authorization')
-        if not auth_header or not auth_header.startswith('Bearer '):
-            logger.error("Authentication Error: No Bearer token provided.")
-            return jsonify({"error": "No authorization token provided"}), 401
-            
-        id_token = auth_header.split('Bearer ')[1]
+        # 1. Get UID from query parameters (used by Live Tracker)
+        uid = request.args.get('userId')
+
+        if not uid:
+             # Fallback: Get UID from token (used by the main mobile app when loading the home screen)
+            auth_header = request.headers.get('Authorization')
+            if not auth_header or not auth_header.startswith('Bearer '):
+                 logger.error("Authentication Error: No Bearer token or User ID provided.")
+                 return jsonify({"error": "No authorization token or User ID provided"}), 401
+            try:
+                id_token = auth_header.split('Bearer ')[1]
+                decoded_token = auth.verify_id_token(id_token)
+                uid = decoded_token['uid']
+            except Exception as auth_error:
+                logger.error(f"Authentication Error: Failed to verify ID token. {auth_error}")
+                return jsonify({"error": "Invalid or expired token."}), 401
         
-        # 2. Verify token securely
-        try:
-            # Explicitly verify the token
-            decoded_token = auth.verify_id_token(id_token)
-            uid = decoded_token['uid']
-        except Exception as auth_error:
-            # CATCH THE AUTH FAILURE and return 401
-            logger.error(f"Authentication Error: Failed to verify ID token. {auth_error}")
-            return jsonify({"error": "Invalid or expired token. Please log in again."}), 401
-        
-        # 3. Proceed with Firestore query if authentication passed
+        # 2. Proceed with Firestore query
         db = firestore.client()
         fields_ref = db.collection('fields')
         query = fields_ref.where('userId', '==', uid)
         docs = query.stream()
 
-        # Convert documents to list (rest of your existing logic)
+        # Convert documents to list
         fields = []
         for doc in docs:
             field_data = doc.to_dict()
@@ -795,12 +928,15 @@ def get_user_fields():
             fields.append(field_data)
         
         logger.info(f"Found {len(fields)} fields for user {uid}")
+        
+        # If the Live Tracker asks, it expects field data in the response body.
+        # It's safer to return the fields list directly.
         return jsonify({"fields": fields})
             
     except Exception as e:
-        # CATCH GENERIC SERVER ERRORS (e.g., Firestore connection issue)
-        logger.error(f"CRITICAL Server Error fetching user fields (Non-Auth related): {e}", exc_info=True)
+        logger.error(f"CRITICAL Server Error fetching user fields: {e}", exc_info=True)
         return jsonify({"error": "Internal server error"}), 500
+
 
 @app.route('/api/field/delete', methods=['POST'])
 def delete_field():
@@ -838,12 +974,14 @@ def delete_field():
 
 @app.route('/api/probe/plant', methods=['POST'])
 def plant_probe_location():
-    """Saves the location of a newly planted probe."""
+    """Saves the location of a newly planted probe to the centralized 'scans' collection.""" # <-- Updated comment
     try:
         if not firestore:
             return jsonify({"error": "Firebase not initialized"}), 500
         
         data = request.get_json()
+        # NOTE: 'fieldId' is not strictly required by the QR scanner's saved data,
+        # but keep it in the required fields list if you want to enforce it.
         required_fields = ['userId', 'fieldId', 'probeId', 'latitude', 'longitude']
         for field in required_fields:
             if field not in data:
@@ -855,23 +993,27 @@ def plant_probe_location():
         location = create_geopoint(data['latitude'], data['longitude'])
         
         probe_data = {
-            'userId': data['userId'],
-            'fieldId': data['fieldId'],
-            'probeId': data['probeId'],
+            'user_id': data['userId'],        # <-- Renamed for consistency with QR scanner
+            'field_id': data['fieldId'],      # <-- Renamed for consistency with QR scanner
+            'probe_id': data['probeId'],
+            'latitude': data['latitude'],     # Keep string for easier access/debug
+            'longitude': data['longitude'],   # Keep string for easier access/debug
             'location': location,
-            'plantedAt': datetime.now()
+            'status': 'active',               # Set status field for consistency
+            'timestamp': datetime.now()       # Use Python datetime for server-side timestamp
         }
         
-        # Store in a new 'probes' collection, using probeId as the document ID
-        doc_ref = db.collection('probes').document(data['probeId'])
-        doc_ref.set(probe_data)
+        # *** CRITICAL CHANGE: Write to the 'scans' collection ***
+        # Let Firestore assign the document ID automatically
+        doc_ref = db.collection('scans').add(probe_data) # Use .add()
         
-        logger.info(f"Probe {data['probeId']} location saved for user {data['userId']}")
-        return jsonify({"success": True, "probeId": data['probeId']})
+        logger.info(f"Probe {data['probeId']} location saved to /scans for user {data['userId']}")
+        return jsonify({"success": True, "scanId": doc_ref[1].id}) # Return the new doc ID
         
     except Exception as e:
-        logger.error(f"Error saving probe location: {e}")
+        logger.error(f"Error saving probe location to /scans: {e}")
         return jsonify({"error": "Internal server error"}), 500
     
+
 if __name__ == '__main__':
     app.run(debug=True, host='0.0.0.0', port=5000)

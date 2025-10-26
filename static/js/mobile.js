@@ -4,7 +4,29 @@
  * @param {string} title - The title for the card (e.g., "Live Status" or a timestamp).
  * @returns {string} - An HTML string representing the card.
  * @param {string} probeId -The ID read from the QR code (e.g., "P-42-W").
+ * @param {number} lat - Center latitude.
+ * @param {number} lng - Center longitude.
+ * @param {number} sizeMeters - Side length of the square (e.g., 5 meters).
+ * @returns {Array<Array<number>>} Leaflet coordinates (array of [lat, lng]).
+ * 
+ * 
  */
+// mobile.js (Near the top or global helper functions)
+if (!Math.radians) {
+    Math.radians = function(degrees) { return degrees * Math.PI / 180; };
+}
+
+function launchQRScanner() {
+    // currentFieldId is set when the user saves a field (or loads one)
+    if (!currentUser || !authToken || !currentFieldId) {
+        alert("Please log in and save a field boundary (Home screen map) before planting probes.");
+        return;
+    }
+    
+    // We pass the token for backend verification and the fieldId for context.
+    window.location.href = `/qr_scanner?token=${authToken}&fieldId=${currentFieldId}`;
+}
+
 function formatSensorDataForDisplay(data, title) {
     const env = data.environment || {};
     const rain = data.rain || {};
@@ -173,11 +195,28 @@ let watchId = null; // Stores the ID for geolocation watch
 let probeMarker = null; // Marker for the user's live position
 let html5QrCode = null; // Instance of the scanner class
 let scannerActive = false;
+let probeMarkersLayer = null;
 
 // Initialize the mobile app
 document.addEventListener('DOMContentLoaded', function() {
     initializeApp();
 });
+
+
+
+
+// mobile.js (Global area)
+
+// Define the custom icon using the image you provided
+const probeMarkerIcon = L.icon({
+    iconUrl: '/static/uploads/probeMarker.png', // <-- Ensure this path is correct
+    iconSize: [40, 40],        // Size of the icon
+    iconAnchor: [20, 40],      // Point of the icon corresponding to the marker's actual location
+    popupAnchor: [0, -35]      // Point from which the popup should open relative to the iconAnchor
+});
+
+
+
 
 /**
  * Initialize the mobile application
@@ -349,6 +388,28 @@ function initializeMap() {
     
     console.log('✅ Map initialized successfully');
 }
+
+function createSquareBuffer(lat, lng, sizeMeters) {
+    // Approximate conversion (rough for small field areas)
+    const latDegreePerMeter = 1 / 111320; // 1 degree latitude ≈ 111,320 meters
+    const lngDegreePerMeter = 1 / (111320 * Math.cos(lat * Math.PI / 180));
+    
+    const halfSideLat = (sizeMeters / 2) * latDegreePerMeter;
+    const halfSideLng = (sizeMeters / 2) * lngDegreePerMeter;
+
+    const minLat = lat - halfSideLat;
+    const maxLat = lat + halfSideLat;
+    const minLng = lng - halfSideLng;
+    const maxLng = lng + halfSideLng;
+
+    return [
+        [minLat, minLng], // SW
+        [minLat, maxLng], // SE
+        [maxLat, maxLng], // NE
+        [maxLat, minLng], // NW
+        [minLat, minLng]  // Close the loop
+    ];
+}
 /**
  * Load user's saved field from backend and display on map
  * (This function is now responsible for showing the GRİDDED view)
@@ -430,8 +491,9 @@ async function loadUserSavedField() {
             returnToMainMap(); // Ensure the view is reset to show the main section before calling display
             
             // Use a short delay to ensure DOM update is complete before displaying the map
-            setTimeout(() => {
+            setTimeout(async () => {
                  displayGriddedField(drawnLayer);
+                 await loadAndDisplayProbeMarkers();
             }, 50);
 
         }
@@ -643,6 +705,83 @@ function displayGriddedField(fieldLayer) {
     }, 10); // 10ms delay
 }
 
+/**
+ * Fetches all probes saved under the current user's UID (from the 'scans' collection) 
+ * and displays them on the home screen map.
+ */
+
+/**
+ * Fetches all probes saved and displays them as markers AND 5m yellow squares.
+ */
+async function loadAndDisplayProbeMarkers() {
+    if (!map || !currentUser || !currentUser.uid) {
+        console.warn("Map or user not ready for probe marker loading.");
+        return;
+    }
+
+    if (probeMarkersLayer) {
+        map.removeLayer(probeMarkersLayer);
+    }
+    probeMarkersLayer = L.layerGroup();
+    let markerBounds = L.latLngBounds([]);
+
+    try {
+        const res = await makeAuthenticatedRequest(`/api/user_scans/${currentUser.uid}`);
+        
+        if (!res.ok) {
+            console.warn(`Failed to fetch probe scan locations. Status: ${res.status}`);
+            return;
+        }
+
+        const data = await res.json();
+        const probes = data.scans || [];
+
+        probes.forEach(scan => {
+            const lat = parseFloat(scan.latitude);
+            const lng = parseFloat(scan.longitude);
+            
+            if (isNaN(lat) || isNaN(lng)) return;
+
+            // --- 1. Draw the 5m Yellow Square Zone ---
+            const squareCoords = createSquareBuffer(lat, lng, 5); // 5 meters square
+            const probeZone = L.polygon(squareCoords, {
+                color: '#f59e0b',       // Orange/Yellow border
+                fillColor: '#fcd34d',   // Light Yellow fill (bg-yellow-300 tone)
+                fillOpacity: 0.4,
+                weight: 1
+            });
+            probeZone.bindTooltip(`Probe Zone (${scan.probe_id})`);
+            probeMarkersLayer.addLayer(probeZone);
+
+
+            // --- 2. Place the Custom Yellow Marker Icon ---
+            const marker = L.marker([lat, lng], { icon: probeMarkerIcon });
+
+            marker.bindPopup(`
+                <h4 class="font-bold">Probe ID: ${scan.probe_id}</h4>
+                <p>Field: ${scan.field_id}</p>
+                <p>Planted: ${new Date(scan.timestamp).toLocaleDateString()}</p>
+            `);
+
+            probeMarkersLayer.addLayer(marker);
+            markerBounds.extend([lat, lng]);
+        });
+
+        // 3. Add all layers to the map
+        if (probeMarkersLayer.getLayers().length > 0) {
+             probeMarkersLayer.addTo(map);
+
+             if (map.getZoom() < 10) { 
+                 map.fitBounds(markerBounds, { padding: [50, 50] });
+             }
+        }
+        
+        console.log(`✅ Loaded ${probes.length} probe markers and zones.`);
+
+    } catch (error) {
+        console.error("❌ Catastrophic error loading probe markers:", error);
+    }
+}
 
 /**
  * Hides the gridded field view and returns to the main map.
@@ -691,29 +830,39 @@ function showMapLoading() {
 
 /** Center map on user's current location (with graceful fallback) */
 /** Center map on user's current location (with graceful fallback) */
+/** Center map on user's current location (with graceful fallback) */
 function locateUserOnMap() {
     if (!map || !navigator.geolocation) {
         alert('Geolocation is not supported by your browser.');
         return;
     }
     
-    const options = { enableHighAccuracy: true, timeout: 8000, maximumAge: 60000 };
+    // CRITICAL: Ensure maximum accuracy and fresh location fix
+    const options = { 
+        enableHighAccuracy: true, 
+        timeout: 1000,
+        maximumAge: 0 // Prevents the browser from using cached, stale location data
+    };
     
     navigator.geolocation.getCurrentPosition(
         (pos) => {
             // SUCCESS: This part runs if location is found
             const lat = pos.coords.latitude;
             const lng = pos.coords.longitude;
+            
+            // Center map and place marker
             map.setView([lat, lng], 16);
             const marker = L.marker([lat, lng]).addTo(map);
             marker.bindPopup('You are here').openPopup();
+            
             if (pos.coords.accuracy) {
                 const acc = pos.coords.accuracy;
                 L.circle([lat, lng], { radius: acc, color: '#10b981', fillColor: '#10b981', fillOpacity: 0.1 }).addTo(map);
             }
+            console.log(`✅ Map centered successfully at: Lat ${lat.toFixed(5)}, Lng ${lng.toFixed(5)}`);
         },
         (error) => {
-            // ERROR: This part runs if location fails
+            // ERROR: This part runs if location fails (often due to security/denial)
             let errorMessage = 'Could not get your location. ';
             switch(error.code) {
                 case error.PERMISSION_DENIED:
@@ -729,8 +878,8 @@ function locateUserOnMap() {
                     errorMessage += 'An unknown error occurred.';
                     break;
             }
-            // Show an alert to the user explaining the problem
-            alert(errorMessage + '\nPlease ensure you are on a secure (HTTPS) connection and have allowed location permissions in your browser settings.');
+            // Alert user and note that the map remains at the default view
+            alert(errorMessage + '\nPlease ensure you are on a secure (HTTPS or localhost) connection.');
         },
         options
     );
@@ -993,6 +1142,29 @@ function updateSensorDisplay() {
     });
 }
 
+// mobile.js (Add this new function)
+
+/**
+ * Checks if a probe was recently planted and triggers map reload.
+ * This should be called immediately after showScreen('home').
+ */
+async function checkAndReloadProbes() {
+    const deploymentSuccess = localStorage.getItem('deployment_success');
+    
+    if (deploymentSuccess === 'true' && map && currentUser) {
+        console.log("Deployment flag detected. Reloading probes and map state...");
+        
+        // 1. Force the map to refresh all markers
+        await loadAndDisplayProbeMarkers(); 
+        
+        // 2. Clear the flag immediately so it doesn't reload on next visit
+        localStorage.removeItem('deployment_success');
+        
+        // Optional: Fly the map to the location of the newly planted marker (if possible)
+        // If your loadAndDisplayProbeMarkers tracked the markers, you could pan here.
+    }
+}
+
 /**
  * Load market trends
  */
@@ -1185,6 +1357,8 @@ function checkAuthenticationStatus() {
 
                 // 4. Show the home screen
                 showScreen('home');
+
+                checkAndReloadProbes();
                 
             } else {
                  // Fallback for failed token or explicit logout
@@ -1694,20 +1868,29 @@ function setupEventListeners() {
     // START Deploying Probes
     // DELETE this block if it appears twice inside setupEventListeners()
 
+// mobile.js
+
+// ... inside setupEventListeners() ...
+
 const startDeploymentBtn = document.getElementById('start-deployment-btn');
 if (startDeploymentBtn) {
     startDeploymentBtn.addEventListener('click', () => {
-        initializeDeploymentMap();
-        showScreen('deployment-tracking');
+        // initializeDeploymentMap(); // This is for the old, internal screen
+        // showScreen('deployment-tracking'); // This is for the old, internal screen
+
+        // CRITICAL NEW CODE: Redirect with token
+        if (currentUser && authToken) {
+            window.location.href = `/live_tracker?token=${authToken}`;
+        } else {
+             alert('Please log in first to use the Live Tracker.');
+        }
     });
 }
 // DELETE this block if it appears twice inside setupEventListeners()
 
-const qrPlantationBtn = document.getElementById('qr-plantation-btn');
+const qrPlantationBtn = document.getElementById('launch-qr-scanner-btn'); 
 if (qrPlantationBtn) {
-    qrPlantationBtn.addEventListener('click', () => {
-         showScreen('qr-scanner');
-    });
+    qrPlantationBtn.addEventListener('click', launchQRScanner);
 }
 
     // Stop Tracking
@@ -2132,6 +2315,8 @@ async function handleProbeScan(probeId) {
         `;
         messageContainer.textContent = "Tap 'Start Scanner' again for the next probe.";
 
+        await loadAndDisplayProbeMarkers();
+
     } catch (error) {
         console.error('Probe Plantation Error:', error);
         statusBox.className = 'p-3 bg-red-100 rounded-lg text-sm font-medium text-red-800';
@@ -2140,6 +2325,8 @@ async function handleProbeScan(probeId) {
 }
 
 /** Save drawn field to backend */
+// mobile.js
+
 async function saveDrawnField() {
     if (!drawnLayer) {
         alert('Please draw a field first');
@@ -2152,8 +2339,11 @@ async function saveDrawnField() {
     }
     const geojson = { type: 'Polygon', coordinates: [coordinates] };
 
+    // NOTE: 'fieldBoundary' must be set before calling this function for accurate local saving.
+    // Assuming fieldBoundary is set when the layer is drawn/edited.
+    
     const fieldId = `field_${Date.now()}_${Math.random().toString(36).substr(2,6)}`;
-    const payload = { fieldId, fieldName: `Field ${new Date().toLocaleDateString()}` , boundary: geojson , userId: currentUser.uid};  //// here are the
+    const payload = { fieldId, fieldName: `Field ${new Date().toLocaleDateString()}` , boundary: geojson , userId: currentUser.uid}; 
 
     try {
         console.log('Saving field with payload:', payload);
@@ -2167,9 +2357,17 @@ async function saveDrawnField() {
             const data = await res.json();
             currentFieldId = data.fieldId;
             console.log('Field saved successfully:', data);
+
+            // === CRITICAL LOCAL STORAGE UPDATE ===
+            try { 
+                localStorage.setItem('currentFieldId', currentFieldId); 
+                // Save the GeoJSON object (which is stored in 'geojson' variable here)
+                localStorage.setItem('savedFieldBoundary', JSON.stringify(geojson)); 
+            } catch (_) {}
+            // ===================================
             
-            // MODIFIED: Instead of showing grid on main map, switch to the gridded satellite view
-            displayGriddedField(drawnLayer);
+            // MODIFIED: Switch to the gridded satellite view (which triggers marker loading)
+            displayGriddedField(drawnLayer); 
             
             alert('Field saved successfully! Displaying gridded satellite view.');
             document.getElementById('save-field-btn').disabled = true;
@@ -2186,7 +2384,6 @@ async function saveDrawnField() {
         alert('Network error saving field: ' + e.message);
     }
 }
-
 /** Fetch RTDB history and update chart */
 async function refreshSensorHistory() {
     try {
