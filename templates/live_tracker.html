@@ -377,7 +377,7 @@
         }
 
         // Use extended timeout for better reliability
-        const options = { enableHighAccuracy: true, maximumAge: 0, timeout: 10000} 
+        const options = { enableHighAccuracy: true, maximumAge: 0, timeout: 50000} 
         
         if (!map) {
             navigator.geolocation.getCurrentPosition(
