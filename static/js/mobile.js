@@ -2084,7 +2084,7 @@ function startLiveTracking() {
     document.getElementById('deployment-status').textContent = 'Status: Tracking started...';
     
     // Options for high accuracy, frequent updates
-    const options = { enableHighAccuracy: true, maximumAge: 0, timeout: 5000 };
+    const options = { enableHighAccuracy: true, maximumAge: 300000, timeout: 50000 };
 
     // Watch position to get continuous updates
     watchId = navigator.geolocation.watchPosition((pos) => {
