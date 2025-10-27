@@ -46,27 +46,6 @@
             box-shadow: 0 4px 6px rgba(16, 185, 129, 0.3); /* Green shadow */
             z-index: 1; 
         }
-
-        /* --- CUSTOM ROTATING MARKER CSS --- */
-        .rotating-marker-icon {
-            display: flex;
-            align-items: center;
-            justify-content: center;
-            width: 36px !important; 
-            height: 36px !important;
-            margin-left: -18px !important; 
-            margin-top: -18px !important;  
-            transform-origin: center center;
-            transition: transform 0.2s ease-out;
-        }
-
-        .rotating-marker-icon img {
-            width: 24px; 
-            height: 24px;
-            display: block;
-        }
-        /* --- END CUSTOM ROTATING MARKER CSS --- */
-
     </style>
 </head>
 <body>
@@ -97,172 +76,412 @@
 
     </div>
 
-    <script>
-        let map, marker, lastPosition, trackingPolyline;
-        let deviceHeading = 0;
-        let watchId = null; // CRITICAL: Store the watch ID
+<script>
+    // Global state variables
+    let map, marker, lastPosition, trackingPolyline;
+    let watchId = null;
+    let fieldLayer = null; 
+    let zoneLayerGroup = null; 
+
+    // --- JINJA VARIABLE PASSED FROM FLASK ---
+    const USER_UID = "{{ user_uid }}"; 
+    const PUNE_FALLBACK_LAT = 18.5204;
+    const PUNE_FALLBACK_LNG = 73.8567;
+
+    // NEW: Variables to manage the static/live tracking state
+    // CRITICAL: isTrackingLive starts TRUE (default: moving like Google Maps)
+    let isTrackingLive = true;      
+    let lastProbeLocation = null;   
+    const GEOFENCE_EXIT_DISTANCE = 0.5; 
+    
+    // --- CUSTOM ICON DEFINITION (YOUR PNG MARKER) ---
+    const userMarkerIcon = L.icon({
+        iconUrl: '/static/uploads/probe_marker.png', 
+        iconSize: [40, 40],        
+        iconAnchor: [20, 40],      
+        popupAnchor: [0, -35]      
+    });
+    // --- END CUSTOM ICON DEFINITION ---
+
+    // --- GEOMETRY HELPERS ---
+    if (!Math.radians) {
+        Math.radians = function(degrees) { return degrees * Math.PI / 180; };
+    }
+
+    /**
+     * Creates a square buffer polygon given a center point and size.
+     */
+    function createSquareBuffer(lat, lng, sizeMeters) {
+        // Ensure lat and lng are floats
+        lat = parseFloat(lat);
+        lng = parseFloat(lng);
         
-        // --- Custom Marker Icon (SVG Pointer) ---
-        const rotatingPointerIcon = L.divIcon({
-            className: 'rotating-marker-icon', 
-            html: `<img src="data:image/svg+xml;base64,${btoa('<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="#00BFFF"><path d="M12 2L4.5 20.29l.71.71L12 18l6.79 3 .71-.71L12 2z"/></svg>')}" alt="Pointer" />`,
-            iconSize: [36, 36], 
-            iconAnchor: [18, 18]
+        const latDegreePerMeter = 1 / 111320; 
+        const lngDegreePerMeter = 1 / (111320 * Math.cos(Math.radians(lat)));
+        
+        const halfSideLat = (sizeMeters / 2) * latDegreePerMeter;
+        const halfSideLng = (sizeMeters / 2) * lngDegreePerMeter;
+
+        const minLat = lat - halfSideLat;
+        const maxLat = lat + halfSideLat;
+        const minLng = lng - halfSideLng;
+        const maxLng = lng + halfSideLng;
+
+        return [
+            [minLat, minLng], [minLat, maxLng], 
+            [maxLat, maxLng], [maxLat, minLng], 
+            [minLat, minLng] 
+        ];
+    }
+    
+    // Simplified geometry helpers (required by your existing code)
+    function getBoundsFromCoordinates(coords) {
+        let minLat = coords[0][1]; let maxLat = coords[0][1];
+        let minLng = coords[0][0]; let maxLng = coords[0][0];
+        coords.forEach(coord => {
+            const [lng, lat] = coord;
+            minLat = Math.min(minLat, lat); maxLat = Math.max(maxLat, lat);
+            minLng = Math.min(minLng, lng); maxLng = Math.max(maxLng, lng);
         });
+        return {
+            min: { lat: minLat, lng: minLng },
+            max: { lat: maxLat, lng: maxLng },
+            center: { lat: (minLat + maxLat) / 2, lng: (minLng + maxLng) / 2 }
+        };
+    }
 
-        // --- Haversine Distance ---
-        function getDistance(lat1, lon1, lat2, lon2) {
-            const R = 6371e3;
-            const φ1 = lat1 * Math.PI/180;
-            const φ2 = lat2 * Math.PI/180;
-            const Δφ = (lat2-lat1) * Math.PI/180;
-            const Δλ = (lon2-lon1) * Math.PI/180;
-
-            const a = Math.sin(Δφ/2) * Math.sin(Δφ/2) +
-                      Math.cos(φ1) * Math.cos(φ2) *
-                      Math.sin(Δλ/2) * Math.sin(Δλ/2);
-            const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1-a));
-
-            return R * c;
+    function isPointInPolygon(point, polygon) {
+        const [x, y] = point; let inside = false;
+        for (let i = 0, j = polygon.length - 1; i < polygon.length; j = i++) {
+            const [xi, yi] = polygon[i]; const [xj, yj] = polygon[j];
+            if (((yi > y) !== (yj > y)) && (x < (xj - xi) * (y - yi) / (yj - yi) + xi)) { inside = !inside; }
         }
+        return inside;
+    }
+
+    function generateFieldGrid(geojson, gridSizeMeters) {
+        if (!geojson || !geojson.coordinates || !geojson.coordinates[0]) return null;
+        const coords = geojson.coordinates[0];
+        const bounds = getBoundsFromCoordinates(coords);
+        const latDegreePerMeter = 1 / 111320;
+        const lngDegreePerMeter = 1 / (111320 * Math.cos(Math.radians(bounds.center.lat)));
+        const gridSizeLat = gridSizeMeters * latDegreePerMeter;
+        const gridSizeLng = gridSizeMeters * lngDegreePerMeter;
+        const gridGroup = L.layerGroup();
+        const latCells = Math.ceil((bounds.max.lat - bounds.min.lat) / gridSizeLat);
+        const lngCells = Math.ceil((bounds.max.lng - bounds.min.lng) / gridSizeLng);
         
-        // --- Device Orientation Handler ---
-        function handleDeviceOrientation(event) {
-            let heading = event.alpha; 
-            if (typeof event.webkitCompassHeading !== 'undefined') {
-                heading = event.webkitCompassHeading;
-            }
-            
-            if (heading !== null && typeof heading !== 'undefined') {
-                deviceHeading = heading;
-                updateMarkerRotation();
-            }
-        }
-
-        // --- Apply Marker Rotation (CSS Transform) ---
-        function updateMarkerRotation() {
-            if (marker && marker._icon && deviceHeading !== null) {
-                const markerElement = marker._icon; 
-                markerElement.style.transform = markerElement.style.transform.replace(/rotate\(([^)]+)\)/, '') + ` rotate(${deviceHeading}deg)`;
-            }
-        }
-
-        function initMap(latitude, longitude) {
-            const userLocation = [latitude, longitude];
-
-            map = L.map('map', {
-                zoomControl: true,
-                attributionControl: false
-            }).setView(userLocation, 18);
-
-            L.tileLayer('https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}', {
-                attribution: 'Tiles © Esri',
-                maxZoom: 20
-            }).addTo(map);
-
-            marker = L.marker(userLocation, { icon: rotatingPointerIcon }).addTo(map);
-            marker.bindPopup("You are here").openPopup();
-            
-            trackingPolyline = L.polyline([userLocation], { color: '#ef4444', weight: 4 }).addTo(map);
-
-            lastPosition = { lat: latitude, lng: longitude };
-            
-            // Request permission for device orientation (for iOS/Safari)
-            if (typeof DeviceOrientationEvent.requestPermission === 'function') {
-                DeviceOrientationEvent.requestPermission()
-                    .then(permissionState => {
-                        if (permissionState === 'granted') {
-                            window.addEventListener('deviceorientation', handleDeviceOrientation);
-                        }
+        for (let i = 0; i < latCells; i++) {
+            for (let j = 0; j < lngCells; j++) {
+                const cellLat1 = bounds.min.lat + (i * gridSizeLat);
+                const cellLng1 = bounds.min.lng + (j * gridSizeLng);
+                const cellLat2 = bounds.min.lat + ((i + 1) * gridSizeLat);
+                const cellLng2 = bounds.min.lng + ((j + 1) * gridSizeLng);
+                const cellCoordsLeaflet = [
+                    [cellLat1, cellLng1], [cellLat2, cellLng1], [cellLat2, cellLng2], [cellLat1, cellLng2]
+                ];
+                const cellCenter = L.polygon(cellCoordsLeaflet).getBounds().getCenter();
+                if (isPointInPolygon([cellCenter.lng, cellCenter.lat], coords)) {
+                     const cellPolygon = L.polygon(cellCoordsLeaflet, {
+                        color: '#6366f1', weight: 1, opacity: 0.8, fillColor: '#6366f1', fillOpacity: 0.1, className: 'grid-cell'
                     });
-            } else {
-                window.addEventListener('deviceorientation', handleDeviceOrientation);
+                    gridGroup.addLayer(cellPolygon);
+                }
             }
-            
-            // Start watching location
-            startLocationWatch();
+        }
+        return gridGroup;
+    }
+    
+    function getDistance(lat1, lon1, lat2, lon2) { 
+        const R = 6371e3; const φ1 = lat1 * Math.PI/180; const φ2 = lat2 * Math.PI/180; const Δφ = (lat2-lat1) * Math.PI/180; const Δλ = (lon2-lon1) * Math.PI/180;
+        const a = Math.sin(Δφ/2) * Math.sin(Δφ/2) + Math.cos(φ1) * Math.cos(φ2) * Math.sin(Δλ/2) * Math.sin(Δλ/2);
+        const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1-a)); return R * c;
+    }
+
+
+    /**
+     * Fetches ALL planted probes for the current user and draws 5x5 zones for each one.
+     */
+    async function loadAndDrawAllProbeZones(user_uid) {
+        console.log(`[Zones] Attempting to load zones for user: ${user_uid}`);
+        if (!map || !user_uid || !zoneLayerGroup || user_uid === 'missing_uid' || user_uid === 'UNAUTHORIZED') {
+             console.error(`[Zones] Prerequisites failed: Map ready=${!!map}, UID ready=${user_uid}`);
+             return;
         }
 
-        // --- NEW: Start Watching Location ---
-        function startLocationWatch() {
-            if (!navigator.geolocation) {
-                document.getElementById("status").textContent = "Geolocation not supported.";
+        zoneLayerGroup.clearLayers(); 
+
+        try {
+            const res = await fetch(`/api/live_probes/${user_uid}`); 
+            if (!res.ok) {
+                console.error(`[Zones] API Call Failed. Status: ${res.status}`);
                 return;
             }
 
-            const options = { enableHighAccuracy: true, maximumAge: 0, timeout: 5000 };
+            const data = await res.json();
+            const probes = data.probes || [];
             
-            // Use getCurrentPosition just for the initial setup if map isn't initialized yet
-            if (!map) {
-                 navigator.geolocation.getCurrentPosition((position) => {
+            console.log(`[Zones] Successfully received ${probes.length} probes.`);
+            
+            let firstProbeLocationCoords = null; 
+            
+            probes.forEach((probe) => {
+                const lat = parseFloat(probe.lat); 
+                const lng = parseFloat(probe.lng);
+                
+                if (isNaN(lat) || isNaN(lng)) return;
+
+                if (!firstProbeLocationCoords) {
+                    firstProbeLocationCoords = { lat, lng }; // Capture the newest probe location
+                }
+                
+                // 1. Draw the 5m Yellow Square Zone 
+                const squareCoords = createSquareBuffer(lat, lng, 5); 
+                L.polygon(squareCoords, {
+                    color: '#f59e0b',       
+                    fillColor: '#fcd34d',   
+                    fillOpacity: 0.6, 
+                    weight: 2
+                }).addTo(zoneLayerGroup).bindPopup(`Probe ${probe.probe_id} Zone (5m²)`);
+                
+                // 2. Place a small circle marker for the probe location
+                L.circleMarker([lat, lng], { radius: 3, color: '#f59e0b', fillColor: '#f59e0b', fillOpacity: 1 })
+                 .addTo(zoneLayerGroup)
+                 .bindPopup(`Probe: ${probe.probe_id}`); 
+            });
+            
+            // ********** CRITICAL LOGIC: SET LIVE MARKER TO STATIC PROBE CENTER **********
+            if (firstProbeLocationCoords) { 
+                const { lat, lng } = firstProbeLocationCoords;
+
+                // 1. Set the live marker ('marker') to the static probe's location
+                if (marker) {
+                    marker.setLatLng([lat, lng]);
+                    marker.bindPopup("Last Planted Probe - Geofence Active").openPopup();
+                    
+                    // CRITICAL: Set the tracking state to static (Purpose: Locked)
+                    isTrackingLive = false;
+                    lastProbeLocation = { lat, lng };
+                }
+
+                // 2. Center the map on the newest probe location
+                map.setView([lat, lng], 18);
+                document.getElementById("status").textContent = "Tracking Paused: Marker at Last Scan.";
+            } else {
+                // If no probes exist, ensure tracking is live
+                isTrackingLive = true;
+                document.getElementById("status").textContent = "Tracking your movement...";
+            }
+            // ********** END CRITICAL LOGIC **********
+
+            console.log(`✅ Loaded and drew ${probes.length} permanent probe zones.`);
+            
+        } catch (e) {
+            console.error("CRITICAL [Zones] Error in loadAndDrawAllProbeZones function:", e);
+        }
+    }
+
+    /**
+     * NEW FUNCTION: Fetches the authenticated user's field boundary from the server.
+     * This replaces the buggy localStorage logic.
+     */
+    async function loadUserFieldBoundary() {
+        if (!USER_UID || USER_UID === 'missing_uid') return;
+
+        try {
+            // We rely on the backend to query the 'fields' collection using the 'userId' field.
+            const res = await fetch(`/api/fields?userId=${USER_UID}`); 
+            if (!res.ok) {
+                console.warn(`[Field Load] No saved field found for user ${USER_UID}.`);
+                return;
+            }
+
+            const data = await res.json();
+            const fields = data.fields || [];
+
+            // We assume the user has one primary field, or just take the first one returned.
+            const fieldData = fields[0]; 
+            
+            if (fieldData && fieldData.boundary) {
+                let geoJson;
+                try {
+                    // Boundary is stored as a JSON string in app.py
+                    geoJson = JSON.parse(fieldData.boundary);
+                } catch (e) {
+                    geoJson = fieldData.boundary;
+                }
+
+                if (geoJson && geoJson.coordinates) {
+                    fieldLayer = L.geoJSON(geoJson, {
+                        style: { color: '#10b981', fillColor: '#10b981', fillOpacity: 0.1, weight: 2 }
+                    }).addTo(map);
+                    
+                    // Generate a 5m grid
+                    const gridLayerGroup = generateFieldGrid(geoJson, 5); 
+                    if (gridLayerGroup) gridLayerGroup.addTo(map);
+
+                    map.fitBounds(fieldLayer.getBounds(), { padding: [20, 20] });
+                    console.log(`[Field Load] Successfully loaded field for user ${USER_UID}.`);
+                }
+            }
+        } catch (e) {
+            console.error("[Field Load] Error fetching field data:", e);
+        }
+    }
+
+
+    // --- MAP INITIALIZATION ---
+    function initMap(latitude, longitude) {
+        const userLocation = [latitude, longitude];
+
+        map = L.map('map', {
+            zoomControl: true,
+            attributionControl: false
+        }).setView(userLocation, 18);
+
+        L.tileLayer('https://mt{s}.google.com/vt/lyrs=s&x={x}&y={y}&z={z}', {
+            subdomains: ['0','1','2','3'],
+            maxZoom: 30,
+            attribution: 'Imagery © Google'
+        }).addTo(map);
+
+        // Initialize persistent zone layer group
+        zoneLayerGroup = L.layerGroup().addTo(map);
+
+        // --- LOAD FIELD BOUNDARY AND GRID ---
+        loadUserFieldBoundary();
+        // --- END LOAD FIELD BOUNDARY AND GRID ---
+
+        // Initialize live marker (using your custom PNG icon) and polyline
+        marker = L.marker(userLocation, { icon: userMarkerIcon }).addTo(map); 
+        marker.bindPopup("You are here (Live Position)").openPopup();
+        
+        trackingPolyline = L.polyline([userLocation], { color: '#ef4444', weight: 4 }).addTo(map);
+        lastPosition = { lat: latitude, lng: longitude };
+        
+        // CRITICAL: Load all permanent zones (this will immediately move the 'marker' if probes exist)
+        if (USER_UID && USER_UID !== 'missing_uid') {
+             loadAndDrawAllProbeZones(USER_UID);
+        }
+    }
+
+    // --- LOCATION UPDATES ---
+    function startLocationWatch() {
+        const PUNE_FALLBACK_LAT = 18.5204;
+        const PUNE_FALLBACK_LNG = 73.8567;
+        
+        if (!navigator.geolocation) {
+            document.getElementById("status").textContent = "Geolocation not supported. Showing fallback map.";
+            initMap(PUNE_FALLBACK_LAT, PUNE_FALLBACK_LNG); 
+            return;
+        }
+
+        // Use extended timeout for better reliability
+        const options = { enableHighAccuracy: true, maximumAge: 0, timeout: 50000} 
+        
+        if (!map) {
+            navigator.geolocation.getCurrentPosition(
+                (position) => {
                     initMap(position.coords.latitude, position.coords.longitude);
-                    // Then proceed to watch
                     watchId = navigator.geolocation.watchPosition(updateLocationDisplay, (error) => {
                         document.getElementById("status").textContent = "Error watching: " + error.message;
                     }, options);
-                 }, (error) => {
-                    document.getElementById("status").textContent = "Error fetching initial location: " + error.message;
-                 }, options);
-            } else {
-                // Map is already initialized, start watching directly
+                }, 
+                (error) => {
+                    document.getElementById("status").textContent = "Error fetching initial location: " + error.message + ". Showing fallback map.";
+                    initMap(PUNE_FALLBACK_LAT, PUNE_FALLBACK_LNG); 
+                    watchId = navigator.geolocation.watchPosition(updateLocationDisplay, (error) => {
+                        document.getElementById("status").textContent = "Error watching: " + error.message;
+                    }, options);
+                }, 
+                options
+            );
+        } else {
+            if (watchId === null) {
                 watchId = navigator.geolocation.watchPosition(updateLocationDisplay, (error) => {
                     document.getElementById("status").textContent = "Error watching: " + error.message;
                 }, options);
             }
-             document.getElementById("status").textContent = "Tracking your movement...";
-             document.getElementById('stop-tracking-btn').textContent = "Stop Tracking";
         }
         
-        // --- NEW: Stop Tracking Function ---
-        function stopTracking() {
-            if (watchId !== null) {
-                navigator.geolocation.clearWatch(watchId);
-                watchId = null;
-                document.getElementById("status").textContent = "Tracking stopped.";
-                document.getElementById('coords-display').textContent = "Tracking stopped.";
-                document.getElementById('stop-tracking-btn').textContent = "Start Tracking"; // Button acts as a toggle
+        document.getElementById("status").textContent = "Tracking your movement...";
+        document.getElementById('stop-tracking-btn').textContent = "Stop Tracking";
+    }
+    
+    function stopTracking() {
+        if (watchId !== null) {
+            navigator.geolocation.clearWatch(watchId);
+            watchId = null;
+            document.getElementById("status").textContent = "Tracking stopped.";
+            document.getElementById('coords-display').textContent = "Tracking stopped.";
+            document.getElementById('stop-tracking-btn').textContent = "Start Tracking";
+        } else {
+            startLocationWatch();
+        }
+    }
+    
+    function updateLocationDisplay(pos) {
+        const latitude = pos.coords.latitude;
+        const longitude = pos.coords.longitude;
+        document.getElementById('coords-display').textContent = `Lat: ${latitude.toFixed(6)}, Lng: ${longitude.toFixed(6)}`;
+        updateMarkerAndPolyline(latitude, longitude);
+    }
+
+    function updateMarkerAndPolyline(latitude, longitude) {
+        if (!map || !marker) return;
+
+        const newPosition = { lat: latitude, lng: longitude };
+        const newLatLng = [latitude, longitude];
+        
+        // Check if lastPosition is set. If not, initialize it.
+        if (!lastPosition) {
+            lastPosition = newPosition;
+        }
+
+        // --- GEOCELL EXIT CHECK (When marker is static) ---
+        if (isTrackingLive === false && lastProbeLocation) {
+            // Calculate distance from the STATIC PROBE (lastProbeLocation)
+            const distanceToProbe = getDistance(lastProbeLocation.lat, lastProbeLocation.lng, latitude, longitude);
+            
+            if (distanceToProbe >= GEOFENCE_EXIT_DISTANCE) {
+                // User has exited the 5m geofence! Enable live tracking.
+                isTrackingLive = true;
+                document.getElementById("status").textContent = `Tracking LIVE | Geofence Exited.`;
+                marker.bindPopup("Tracking LIVE").openPopup();
+                // Fall through to the LIVE MOVEMENT LOGIC below
             } else {
-                // If the button is used to restart tracking
-                startLocationWatch();
+                // User is still inside the 5m geofence. Marker remains STATIC.
+                document.getElementById("status").textContent = `Tracking Paused: Within ${distanceToProbe.toFixed(1)}m of scan. Move ${GEOFENCE_EXIT_DISTANCE}m to activate.`;
+                
+                // CRITICAL: Prevent polyline from starting from the probe location
+                return; // EXIT: Do not move the marker or polyline
             }
         }
-        
-        // --- NEW: Combined Handler to Update Display and Marker ---
-        function updateLocationDisplay(pos) {
-            const latitude = pos.coords.latitude;
-            const longitude = pos.coords.longitude;
-            
-            // Update Coordinates Display
-            document.getElementById('coords-display').textContent = `Lat: ${latitude.toFixed(6)}, Lng: ${longitude.toFixed(6)}`;
-            
-            // Update Marker and Polyline
-            updateMarkerAndPolyline(latitude, longitude);
-        }
+        // --- END GEOCELL EXIT CHECK ---
 
-        function updateMarkerAndPolyline(latitude, longitude) {
-            if (!map || !marker) return;
 
-            const newPosition = { lat: latitude, lng: longitude };
-            const distance = getDistance(lastPosition.lat, lastPosition.lng, latitude, longitude);
-            const newLatLng = [latitude, longitude];
+        // --- LIVE MOVEMENT LOGIC (Runs if isTrackingLive is TRUE) ---
+        if (isTrackingLive) {
+            const distanceMoved = getDistance(lastPosition.lat, lastPosition.lng, latitude, longitude);
 
-            // Update marker if moved more than 0.5 meters
-            if (distance > 0.5) { 
+            // Always update marker if position changed by a minimal threshold (0.5m)
+            if (distanceMoved > 0.5) { 
                 marker.setLatLng(newLatLng);
                 trackingPolyline.addLatLng(newLatLng);
-                map.panTo(newLatLng);
+                // Pan map ONLY when tracking is active
+                map.panTo(newLatLng); 
                 lastPosition = newPosition;
-                document.getElementById("status").textContent = `Tracking | Moved ${distance.toFixed(2)} meters`;
+                
+                document.getElementById("status").textContent = `Tracking LIVE | Moved ${distanceMoved.toFixed(2)} meters`;
             }
-            updateMarkerRotation(); // Always update rotation
         }
+    }
 
-        // --- Initial Call and Event Listener ---
-        document.addEventListener('DOMContentLoaded', () => {
-             document.getElementById('stop-tracking-btn').addEventListener('click', stopTracking);
-             // Kick off the initial location fetch and watch
-             startLocationWatch();
-        });
-    </script>
+    // --- Initial Call and Event Listener ---
+    document.addEventListener('DOMContentLoaded', () => {
+         document.getElementById('stop-tracking-btn').addEventListener('click', stopTracking);
+         startLocationWatch();
+    });
+</script>
 </body>
 </html>

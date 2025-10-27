@@ -10,6 +10,8 @@
     <link href="https://fonts.googleapis.com/css2?family=Poppins:wght@400;600;700&display=swap" rel="stylesheet">
 
     <script src="https://unpkg.com/html5-qrcode"></script>
+    <script src="https://www.gstatic.com/firebasejs/9.23.0/firebase-app-compat.js"></script>
+<script src="https://www.gstatic.com/firebasejs/9.23.0/firebase-firestore-compat.js"></script>
     
 
     <style>
@@ -74,133 +76,147 @@
 
     </div>
 
-    <script type="module">
-        import { initializeApp } from "https://www.gstatic.com/firebasejs/10.12.1/firebase-app.js";
-        import { getFirestore, collection, addDoc } from "https://www.gstatic.com/firebasejs/10.12.1/firebase-firestore.js";
+    <script>
+    // --- IMPORTANT: This uses the Namespaced (Compat) SDK method ---
+    
+    // Global variables passed from Flask (assuming they are defined in a prior script block)
+    const USER_UID = "{{ user_uid }}";
+    const FIELD_ID = "{{ field_id }}"; 
 
-        /* ---------------- FIREBASE CONFIG ---------------- */
-        // NOTE: Firestore requires the modular SDK import method used above.
-        const firebaseConfig = {
-            apiKey: "AIzaSyAMF-H37hakWbtwGfy8-wvTWV_5RtYoUmY",
-            authDomain: "esp32---demo-ac37f.firebaseapp.com",
-            databaseURL: "https://esp32---demo-ac37f-default-rtdb.europe-west1.firebasedatabase.app",
-            projectId: "esp32---demo-ac37f",
-            storageBucket: "esp32---demo-ac37f.firebasestorage.app",
-            messagingSenderId: "465358325818",
-            appId: "1:465358325818:web:11322d74bef27fc9d38d03",
-            measurementId: "G-TT46DMMWTC"
-        };
-        const app = initializeApp(firebaseConfig);
-        const db = getFirestore(app);
+    /* ---------------- FIREBASE SETUP ---------------- */
+    // Initialize the app (This must be done via a standard script block)
+    const firebaseConfig = {
+        apiKey: "AIzaSyAMF-H37hakWbtwGfy8-wvTWV_5RtYoUmY",
+        authDomain: "esp32---demo-ac37f.firebaseapp.com",
+        databaseURL: "https://esp32---demo-ac37f-default-rtdb.europe-west1.firebasedatabase.app",
+        projectId: "esp32---demo-ac37f",
+        appId: "1:465358325818:web:11322d74bef27fc9d38d03",
+    };
+    const app = firebase.initializeApp(firebaseConfig);
+    // Access Firestore using the global 'firebase' object
+    const db = firebase.firestore(); 
+    
+    /* ---------------- GLOBAL SCANNER VARIABLES ---------------- */
+    let offlineQueue = JSON.parse(localStorage.getItem("offlineQueue")) || [];
+    // CRITICAL: Html5Qrcode must be instantiated here
+    const html5QrCode = new Html5Qrcode("reader"); 
+    const qrConfig = { fps: 10, qrbox: { width: 250, height: 250 }, facingMode: "environment" };
+
+
+    /* ---------------- OFFLINE/SYNC HELPERS ---------------- */
+    function saveOffline(data) {
+        offlineQueue.push(data);
+        localStorage.setItem("offlineQueue", JSON.stringify(offlineQueue));
+    }
+    // (syncOffline function would be placed here)
+
+    /* ---------------- QR SCANNER FUNCTIONS ---------------- */
+    async function startScanner() {
+        document.getElementById('status').innerText = "Scanning for QR…";
+        document.getElementById('retryBtn').style.display = "none";
         
-        /* ---------------- OFFLINE QUEUE SETUP ---------------- */
-        let offlineQueue = JSON.parse(localStorage.getItem("offlineQueue")) || [];
+        try {
+            if (html5QrCode.isScanning) await html5QrCode.stop(); 
+        } catch (e) {}
 
-        function saveOffline(data) {
-            offlineQueue.push(data);
-            localStorage.setItem("offlineQueue", JSON.stringify(offlineQueue));
-        }
-
-        async function syncOffline() {
-            if (offlineQueue.length === 0) return;
-            document.getElementById('status').innerText = `Syncing ${offlineQueue.length} pending scans…`;
-            for (const data of offlineQueue) {
-                try {
-                    // Use addDoc for modular SDK
-                    await addDoc(collection(db, "probes"), data); 
-                } catch (e) {
-                    console.error("Sync error:", e);
-                    return;
-                }
-            }
-            offlineQueue = [];
-            localStorage.removeItem("offlineQueue");
-            document.getElementById('status').innerText = "All offline scans synced!";
-        }
-
-        window.addEventListener("online", syncOffline);
-
-        /* ---------------- QR SCANNER INITIALIZATION ---------------- */
-        const html5QrCode = new Html5Qrcode("reader");
-        const qrConfig = { fps: 10, qrbox: { width: 250, height: 250 } };
-
-        async function startScanner() {
-            document.getElementById('status').innerText = "Scanning for QR…";
-            // Ensure the previous stop has finished before starting a new one
-            try {
-                if (html5QrCode.isScanning) await html5QrCode.stop();
-            } catch (e) {}
-
-            html5QrCode.start(
-                { facingMode: "environment" },
-                qrConfig,
-                async (qrText) => {
-                    document.getElementById('status').innerText = `QR Detected: ${qrText}`;
-                    await html5QrCode.stop();
-                    handleQRScan(qrText);
-                },
-                (errorMessage) => {}
-            ).catch(err => {
-                document.getElementById('status').innerText = `Error: Cannot start camera. (${err.name})`;
-                document.getElementById('retryBtn').innerText = "Retry Scan";
-                document.getElementById('retryBtn').style.display = "block";
-            });
-        }
-
-        async function handleQRScan(probeId) {
-            document.getElementById('status').innerText = `Probe ID ${probeId}: Fetching GPS location…`;
-
-            if (!navigator.geolocation) {
-                document.getElementById('status').innerText = "Geolocation not supported!";
-                return;
-            }
-            
-            navigator.geolocation.getCurrentPosition(async (pos) => {
-                const data = {
-                    probe_id: probeId,
-                    latitude: pos.coords.latitude,
-                    longitude: pos.coords.longitude,
-                    timestamp: new Date(),
-                    user_id: "rootai_user", // TODO: Replace with authenticated user ID
-                    field_id: "field_A", // TODO: Replace with currently active field ID
-                    status: "active"
-                };
-
-                try {
-                    if (navigator.onLine) {
-                        // Use addDoc for modular SDK
-                        await addDoc(collection(db, "scans"), data); 
-                        document.getElementById('status').innerText = "✅ Scan saved successfully! Move towards the next probe.";
-                    } else {
-                        saveOffline(data);
-                        document.getElementById('status').innerText = "📦 Saved offline, will sync later! Move towards the next probe.";
-                    }
-                } catch (e) {
-                    console.error("Firebase save error:", e);
-                    saveOffline(data);
-                    document.getElementById('status').innerText = "⚠️ Error, saved offline!";
-                }
-
-                document.getElementById('retryBtn').innerText = "Scan Next Probe";
-                document.getElementById('retryBtn').style.display = "block";
-
-            }, () => {
-                document.getElementById('status').innerText = "Unable to get location! Try again.";
-                document.getElementById('retryBtn').innerText = "Retry Scan";
-                document.getElementById('retryBtn').style.display = "block";
-            }, { enableHighAccuracy: true, timeout: 10000 });
-        }
-
-        document.getElementById('retryBtn').addEventListener('click', () => {
-            document.getElementById('retryBtn').style.display = "none";
-            startScanner();
+        html5QrCode.start(
+            { facingMode: "environment" },
+            qrConfig,
+            async (qrText) => {
+                // SUCCESS: Stop the camera immediately after decoding
+                await html5QrCode.stop(); 
+                handleQRScan(qrText); // Go to saving logic
+            }, 
+            (errorMessage) => {}
+        ).catch(err => {
+            document.getElementById('status').innerText = `Error: Cannot start camera. (${err.name || err})`;
+            document.getElementById('retryBtn').innerText = "Retry Scan";
+            document.getElementById('retryBtn').style.display = "block";
         });
+    }
 
-        // Initial check for online status to sync and then start scanning
-        if (navigator.onLine) syncOffline();
+    // qr_scanner.html
+
+async function handleQRScan(probeId) {
+    document.getElementById('status').innerText = `Probe ID ${probeId}: Fetching GPS location…`;
+
+    if (!navigator.geolocation) {
+        document.getElementById('status').innerText = "Geolocation not supported!";
+        return;
+    }
+
+    navigator.geolocation.getCurrentPosition(async (pos) => {
+        const latitude = pos.coords.latitude;
+        const longitude = pos.coords.longitude;
         
-        // Start scanner on load
+        // 1. Prepare data payload
+        const dataToSave = {
+            field_id: FIELD_ID, 
+            probe_id: probeId,
+            latitude: latitude.toFixed(6),
+            longitude: longitude.toFixed(6),
+            // CRITICAL FIX: Use the authenticated UID variable passed from Flask
+            user_id: USER_UID, 
+            // CRITICAL CHANGE: Use GeoPoint for location data
+            location: new firebase.firestore.GeoPoint(latitude, longitude),
+            // CRITICAL: namespaced API for serverTimestamp 
+            timestamp: firebase.firestore.FieldValue.serverTimestamp(), 
+            status: "active"
+        };
+
+        try {
+            if (navigator.onLine) {
+                // CRITICAL: Write to the top-level 'scans' collection
+                await db
+                    .collection("scans")
+                    .add(dataToSave);
+                    
+                // --- SUCCESS MESSAGE & FLAG SETTING ---
+                document.getElementById('status').innerHTML = `
+                    <div class="text-green-600 font-semibold mb-2">✅ Probe planted successfully!</div>
+                    <p class="font-bold text-green-700 mt-2">Planted Position:</p>
+                    <p class="text-sm">Lat: ${latitude.toFixed(6)}, Lng: ${longitude.toFixed(6)}</p>
+                    <p class="mt-2">Move towards the next probe.</p>
+                `;
+                
+                // Set flag to trigger map visualization reload on the home/live screen
+                localStorage.setItem('deployment_success', 'true');
+                // --- END SUCCESS MESSAGE & FLAG SETTING ---
+                
+            } else {
+                saveOffline(dataToSave);
+                document.getElementById('status').innerText = "📦 Saved offline, will sync later!";
+            }
+        } catch (e) {
+            console.error("Firebase save error:", e);
+            document.getElementById('status').innerText = "⚠️ Error saving, data saved offline or permission issue!";
+        }
+
+        document.getElementById('retryBtn').innerText = "Scan Next Probe";
+        document.getElementById('retryBtn').style.display = "block";
+
+    }, () => {
+        // Geolocation error handling
+        document.getElementById('status').innerText = "Unable to get location! Try again.";
+        document.getElementById('retryBtn').innerText = "Retry Scan";
+        document.getElementById('retryBtn').style.display = "block";
+    }, { enableHighAccuracy: true, timeout: 10000 });
+}
+
+    // --- FIX: The "Scan Next Probe" button listener ---
+    document.getElementById('retryBtn').addEventListener('click', () => {
+        // 1. Hide the success message container
+        document.getElementById('status').innerHTML = "Initializing camera…";
+        
+        // 2. Hide the button
+        document.getElementById('retryBtn').style.display = "none";
+        
+        // 3. CRITICAL: Restart the full scanner/camera initialization
         startScanner();
-    </script>
+    });
+
+    // Start scanner on initial load
+    startScanner();
+</script>
 </body>
 </html>
