@@ -8,8 +8,6 @@
  * @param {number} lng - Center longitude.
  * @param {number} sizeMeters - Side length of the square (e.g., 5 meters).
  * @returns {Array<Array<number>>} Leaflet coordinates (array of [lat, lng]).
- * 
- * 
  */
 // mobile.js (Near the top or global helper functions)
 if (!Math.radians) {
