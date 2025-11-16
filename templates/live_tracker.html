@@ -101,6 +101,13 @@
         iconAnchor: [20, 40],      
         popupAnchor: [0, -35]      
     });
+
+    const probeStaticIcon = L.icon({
+    iconUrl: '/static/uploads/probe_marker.png', 
+    iconSize: [40, 40],        
+    iconAnchor: [20, 40],      
+    popupAnchor: [0, -35]      
+});
     // --- END CUSTOM ICON DEFINITION ---
 
     // --- GEOMETRY HELPERS ---
@@ -235,7 +242,7 @@
                     firstProbeLocationCoords = { lat, lng }; // Capture the newest probe location
                 }
                 
-                // 1. Draw the 5m Yellow Square Zone 
+                // 1. Draw the 5m Yellow Square Zone (PERSISTENT YELLOW AREA)
                 const squareCoords = createSquareBuffer(lat, lng, 5); 
                 L.polygon(squareCoords, {
                     color: '#f59e0b',       
@@ -244,33 +251,21 @@
                     weight: 2
                 }).addTo(zoneLayerGroup).bindPopup(`Probe ${probe.probe_id} Zone (5m²)`);
                 
-                // 2. Place a small circle marker for the probe location
-                L.circleMarker([lat, lng], { radius: 3, color: '#f59e0b', fillColor: '#f59e0b', fillOpacity: 1 })
+                // 2. Place the Marker (PERSISTENT PNG MARKER)
+                // CRITICAL FIX: Use the probeStaticIcon here
+                L.marker([lat, lng], { icon: probeStaticIcon }) 
                  .addTo(zoneLayerGroup)
                  .bindPopup(`Probe: ${probe.probe_id}`); 
             });
             
-            // ********** CRITICAL LOGIC: SET LIVE MARKER TO STATIC PROBE CENTER **********
+            // ********** CRITICAL LOGIC: REMOVE LOCKING LOGIC **********
             if (firstProbeLocationCoords) { 
                 const { lat, lng } = firstProbeLocationCoords;
-
-                // 1. Set the live marker ('marker') to the static probe's location
-                if (marker) {
-                    marker.setLatLng([lat, lng]);
-                    marker.bindPopup("Last Planted Probe - Geofence Active").openPopup();
-                    
-                    // CRITICAL: Set the tracking state to static (Purpose: Locked)
-                    isTrackingLive = false;
-                    lastProbeLocation = { lat, lng };
-                }
-
-                // 2. Center the map on the newest probe location
+                // We center the map on the last probe location for context
                 map.setView([lat, lng], 18);
-                document.getElementById("status").textContent = "Tracking Paused: Marker at Last Scan.";
+                document.getElementById("status").textContent = "Tracking LIVE. Map centered on last probe.";
             } else {
-                // If no probes exist, ensure tracking is live
-                isTrackingLive = true;
-                document.getElementById("status").textContent = "Tracking your movement...";
+                document.getElementById("status").textContent = "Tracking LIVE. No previous probes found.";
             }
             // ********** END CRITICAL LOGIC **********
 
@@ -280,7 +275,6 @@
             console.error("CRITICAL [Zones] Error in loadAndDrawAllProbeZones function:", e);
         }
     }
-
     /**
      * NEW FUNCTION: Fetches the authenticated user's field boundary from the server.
      * This replaces the buggy localStorage logic.
@@ -427,55 +421,32 @@
         updateMarkerAndPolyline(latitude, longitude);
     }
 
-    function updateMarkerAndPolyline(latitude, longitude) {
-        if (!map || !marker) return;
+    // live_tracker.html
 
-        const newPosition = { lat: latitude, lng: longitude };
-        const newLatLng = [latitude, longitude];
-        
-        // Check if lastPosition is set. If not, initialize it.
-        if (!lastPosition) {
-            lastPosition = newPosition;
-        }
+function updateMarkerAndPolyline(latitude, longitude) {
+    if (!map || !marker) return;
 
-        // --- GEOCELL EXIT CHECK (When marker is static) ---
-        if (isTrackingLive === false && lastProbeLocation) {
-            // Calculate distance from the STATIC PROBE (lastProbeLocation)
-            const distanceToProbe = getDistance(lastProbeLocation.lat, lastProbeLocation.lng, latitude, longitude);
-            
-            if (distanceToProbe >= GEOFENCE_EXIT_DISTANCE) {
-                // User has exited the 5m geofence! Enable live tracking.
-                isTrackingLive = true;
-                document.getElementById("status").textContent = `Tracking LIVE | Geofence Exited.`;
-                marker.bindPopup("Tracking LIVE").openPopup();
-                // Fall through to the LIVE MOVEMENT LOGIC below
-            } else {
-                // User is still inside the 5m geofence. Marker remains STATIC.
-                document.getElementById("status").textContent = `Tracking Paused: Within ${distanceToProbe.toFixed(1)}m of scan. Move ${GEOFENCE_EXIT_DISTANCE}m to activate.`;
-                
-                // CRITICAL: Prevent polyline from starting from the probe location
-                return; // EXIT: Do not move the marker or polyline
-            }
-        }
-        // --- END GEOCELL EXIT CHECK ---
-
-
-        // --- LIVE MOVEMENT LOGIC (Runs if isTrackingLive is TRUE) ---
-        if (isTrackingLive) {
-            const distanceMoved = getDistance(lastPosition.lat, lastPosition.lng, latitude, longitude);
-
-            // Always update marker if position changed by a minimal threshold (0.5m)
-            if (distanceMoved > 0.5) { 
-                marker.setLatLng(newLatLng);
-                trackingPolyline.addLatLng(newLatLng);
-                // Pan map ONLY when tracking is active
-                map.panTo(newLatLng); 
-                lastPosition = newPosition;
-                
-                document.getElementById("status").textContent = `Tracking LIVE | Moved ${distanceMoved.toFixed(2)} meters`;
-            }
-        }
+    const newPosition = { lat: latitude, lng: longitude };
+    const newLatLng = [latitude, longitude];
+    
+    // Check if lastPosition is set. If not, initialize it.
+    if (!lastPosition) {
+        lastPosition = newPosition;
     }
+
+    // Calculate distance moved
+    const distanceMoved = getDistance(lastPosition.lat, lastPosition.lng, latitude, longitude);
+
+    // CRITICAL: Always move the marker and pan the map if the position changes by > 0.5m
+    if (distanceMoved > 0.5) { 
+        marker.setLatLng(newLatLng);
+        trackingPolyline.addLatLng(newLatLng);
+        map.panTo(newLatLng); 
+        lastPosition = newPosition;
+        
+        document.getElementById("status").textContent = `Tracking LIVE | Moved ${distanceMoved.toFixed(2)} meters`;
+    }
+}
 
     // --- Initial Call and Event Listener ---
     document.addEventListener('DOMContentLoaded', () => {

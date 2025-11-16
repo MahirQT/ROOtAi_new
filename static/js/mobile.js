@@ -8,6 +8,11 @@
  * @param {number} lng - Center longitude.
  * @param {number} sizeMeters - Side length of the square (e.g., 5 meters).
  * @returns {Array<Array<number>>} Leaflet coordinates (array of [lat, lng]).
+ * @param {string} plantingDateISO - The ISO string of the planting date from Firestore.
+ * @param {string} stage  stage as the golbal variable
+ * @param {string} metricPath - The metric name (e.g., "environment.temperature")
+ * @returns {object} - An object with { border, background } colors.
+ *
  * 
  * 
  */
@@ -30,6 +35,9 @@ function launchQRScanner() {
 function formatSensorDataForDisplay(data, title) {
     const env = data.environment || {};
     const rain = data.rain || {};
+    
+    // --- Add this line ---
+    const plantStage = data.plant_stage || 'N/A';
 
     const temp = env.temperature !== undefined ? `${env.temperature}°C` : 'N/A';
     const humidity = env.humidity !== undefined ? `${env.humidity}%` : 'N/A';
@@ -64,6 +72,9 @@ function formatSensorDataForDisplay(data, title) {
         <div class="sensor-card">
             <h3 class="font-bold text-md text-gray-800 border-b pb-2 mb-2">${title}</h3>
             <div class="grid grid-cols-2 gap-x-4 gap-y-1 text-sm">
+                
+                <span class="text-gray-600">Plant Stage:</span><span class="font-medium text-right">${plantStage}</span>
+
                 <span class="text-gray-600">Air Temp:</span><span class="font-medium text-right">${temp}</span>
                 <span class="text-gray-600">Air Humidity:</span><span class="font-medium text-right">${humidity}</span>
                 <span class="text-gray-600">Rain Count:</span><span class="font-medium text-right">${rainCount}</span>
@@ -73,6 +84,9 @@ function formatSensorDataForDisplay(data, title) {
     `;
 }
 
+/**
+ * Fetches the live_status from the backend and displays it.
+ */
 /**
  * Fetches the live_status from the backend and displays it.
  */
@@ -107,12 +121,25 @@ async function fetchCurrentStatus() {
         // Use the helper function to format the data and display it
         displayContainer.innerHTML = formatSensorDataForDisplay(data, 'Live Status');
 
+        // --- This block makes the dropdown persistent on page load ---
+        const stageSelectorContainer = document.getElementById('plant-stage-selector');
+        const stageSelect = document.getElementById('plant-stage-select');
+        
+        if (stageSelect && stageSelectorContainer) {
+            // If a plant stage is saved, show the dropdown and set its value
+            if (data.plant_stage) {
+                stageSelect.value = data.plant_stage;
+            }
+            // Show the dropdown selector
+            stageSelectorContainer.classList.remove('hidden'); 
+        }
+        // --- End of block ---
+
     } catch (error) {
         console.error('Error fetching current status:', error);
         displayContainer.innerHTML = `<p class="text-center text-red-500 py-4">Error loading data. Check console for details.</p>`;
     }
 }
-
 /**
  * Fetches the historical_logs from the backend and displays them.
  */
@@ -389,6 +416,28 @@ function initializeMap() {
     console.log('✅ Map initialized successfully');
 }
 
+function getMetricColor(metricPath) {
+    if (metricPath.includes('temperature')) {
+        // Red for Temperature
+        return { border: '#ef4444', background: 'rgba(239, 68, 68, 0.5)' };
+    }
+    if (metricPath.includes('humidity')) {
+        // Brown for Humidity
+        return { border: '#A52A2A', background: 'rgba(165, 42, 42, 0.5)' };
+    }
+    if (metricPath.includes('moisture')) {
+        // Green for Moisture
+        return { border: '#10b981', background: 'rgba(16, 185, 129, 0.5)' };
+    }
+    if (metricPath.includes('rain')) {
+        // Blue for Rain Count
+        return { border: '#3b82f6', background: 'rgba(59, 130, 246, 0.5)' };
+    }
+    // Default Gray
+    return { border: '#6b7280', background: 'rgba(107, 114, 128, 0.5)' };
+}
+
+
 function createSquareBuffer(lat, lng, sizeMeters) {
     // Approximate conversion (rough for small field areas)
     const latDegreePerMeter = 1 / 111320; // 1 degree latitude ≈ 111,320 meters
@@ -410,6 +459,10 @@ function createSquareBuffer(lat, lng, sizeMeters) {
         [minLat, minLng]  // Close the loop
     ];
 }
+/**
+ * Load user's saved field from backend and display on map
+ * (This function is now responsible for showing the GRİDDED view)
+ */
 /**
  * Load user's saved field from backend and display on map
  * (This function is now responsible for showing the GRİDDED view)
@@ -442,10 +495,21 @@ async function loadUserSavedField() {
         if (!userField) {
             console.log('No saved field found for user. Allowing map drawing.');
             // clearMapStateAndUI() already handled UI reset.
+            
+            // --- FIX 2 ---
+            // Call with null to show the "Mark Planting Day" button
+            updatePlantationStatus(null);
+            // --- END FIX 2 ---
+            
             return; // EXIT GRACEFULLY: New user is ready to draw map.
         }
         
         console.log('Found saved field from backend:', userField.fieldId || 'unknown-id');
+        
+        // --- FIX 1 ---
+        // This line passes the saved date (or undefined) to the UI function
+        updatePlantationStatus(userField.plantingDate);
+        // --- END FIX 1 ---
         
         // Parse boundary data
         let boundary;
@@ -503,6 +567,69 @@ async function loadUserSavedField() {
     }
 }
 // mobile.js
+
+function updatePlantationStatus(plantingDateISO) {
+    const statusEl = document.getElementById('plantation-status');
+    const plantBtn = document.getElementById('plant-now-card');
+
+    if (!plantingDateISO) {
+        // No planting date set, show the button to plant
+        statusEl.classList.add('hidden');
+        plantBtn.classList.remove('hidden');
+        return;
+    }
+
+    const plantDate = new Date(plantingDateISO);
+    const now = new Date();
+    
+    // Calculate difference in milliseconds
+    const diffTime = Math.abs(now - plantDate);
+    
+    // Calculate difference in days (and add 1, so planting day is "Day 1")
+    const diffDays = Math.floor(diffTime / (1000 * 60 * 60 * 24)) + 1;
+
+    statusEl.innerHTML = `
+        <span class="font-bold text-2xl text-green-700">Day ${diffDays}</span>
+        <p class="text-sm text-gray-600">of your plantation.</p>
+    `;
+    statusEl.classList.remove('hidden');
+    
+    // Hide the "Plant Now" button since it's already planted
+    plantBtn.classList.add('hidden');
+}
+
+/**
+ * Handles the click on the "Mark Planting Day" button.
+ */
+async function handlePlantNow() {
+    if (!currentFieldId) {
+        alert("Please save your field map before marking the planting day.");
+        return;
+    }
+    
+    if (!confirm("Are you sure you want to mark today as the planting day for this field?")) {
+        return;
+    }
+
+    try {
+        const res = await makeAuthenticatedRequest('/api/user/plant', {
+            method: 'POST',
+            body: JSON.stringify({ fieldId: currentFieldId })
+        });
+        
+        if (!res.ok) {
+            throw new Error("Failed to save planting date.");
+        }
+
+        const data = await res.json();
+        // Immediately update the UI with the new date
+        updatePlantationStatus(data.plantingDate);
+
+    } catch (error) {
+        console.error("Error marking planting day:", error);
+        alert("An error occurred. Please try again.");
+    }
+}
 
 /**
  * Initializes and starts the QR code scanner.
@@ -840,7 +967,7 @@ function locateUserOnMap() {
     // CRITICAL: Ensure maximum accuracy and fresh location fix
     const options = { 
         enableHighAccuracy: true, 
-        timeout: 1000,
+        timeout: 10000000,
         maximumAge: 0 // Prevents the browser from using cached, stale location data
     };
     
@@ -994,6 +1121,50 @@ async function loadLiveWeather() {
     } catch (_) { /* ignore */ }
 }
 
+async function handlePlantStageUpdate(stage) {
+    if (!currentUser) {
+        alert("You must be logged in to do this.");
+        return;
+    }
+
+    const saveBtn = document.getElementById('save-stage-btn');
+    if (saveBtn) {
+        saveBtn.disabled = true;
+        saveBtn.textContent = 'Saving...';
+    }
+
+    try {
+        const res = await makeAuthenticatedRequest('/api/field/stage', {
+            method: 'POST',
+            // --- THIS IS THE FIX ---
+            // The payload no longer needs fieldId
+            body: JSON.stringify({ 
+                stage: stage 
+            })
+            // --- END FIX ---
+        });
+
+        if (!res.ok) {
+            throw new Error("Failed to save plant stage.");
+        }
+        
+        const data = await res.json();
+        console.log(`Plant stage updated to ${data.stage}`);
+        
+        alert(`Plant stage saved as: ${data.stage}`);
+        if (saveBtn) saveBtn.textContent = 'Saved!';
+        setTimeout(() => {
+            if (saveBtn) saveBtn.textContent = 'Save';
+        }, 2000); 
+        
+    } catch (error) {
+        console.error("Error updating plant stage:", error);
+        alert("An error occurred. Please try again.");
+    } finally {
+        if (saveBtn) saveBtn.disabled = false;
+    }
+}
+
 function updateWeatherDisplay(weather, lat, lng) {
     try {
         const header = document.querySelector('#home-screen .text-center');
@@ -1010,9 +1181,21 @@ function updateWeatherDisplay(weather, lat, lng) {
 /**
  * Load sensor data
  */
+/**
+ * Load sensor data
+ */
 async function loadSensorData() {
     try {
-        const response = await fetch('/api/rtdb/sensor-data/latest');
+        // FIX: Check for user and add UID to request
+        if (!currentUser) {
+            console.warn("loadSensorData: No user logged in.");
+            return; 
+        }
+        const uid = currentUser.uid;
+        const fieldId = 'field_A'; // Default field
+
+        const response = await fetch(`/api/rtdb/sensor-data/latest?userId=${uid}&fieldId=${fieldId}`);
+        
         if (response.ok) {
             sensorData = await response.json();
             updateSensorDisplay();
@@ -1274,9 +1457,21 @@ async function loadFieldList() {
 /**
  * Load current alerts
  */
+/**
+ * Load current alerts
+ */
 async function loadCurrentAlerts() {
     try {
-        const response = await fetch('/api/alerts/current');
+        // FIX: Check for user and add UID to request
+        if (!currentUser) {
+            console.warn("loadCurrentAlerts: No user logged in.");
+            return; 
+        }
+        const uid = currentUser.uid;
+        const fieldId = 'field_A'; // Default field
+        
+        const response = await fetch(`/api/alerts/current?userId=${uid}&fieldId=${fieldId}`);
+        
         if (response.ok) {
             const data = await response.json();
             updateAlertsDisplay(data.alerts || []);
@@ -1752,6 +1947,9 @@ function setupEventListeners() {
         connectBtn.addEventListener('click', connectWithDoot);
     }
     
+    // ... (your other listeners like saveBtn, returnBtn, etc.)
+    document.getElementById('plant-now-card').addEventListener('click', handlePlantNow);
+
     // Field selection
     const fieldSelect = document.getElementById('field-select');
     if (fieldSelect) {
@@ -1830,6 +2028,23 @@ function setupEventListeners() {
         });
     }
 
+
+    const saveStageBtn = document.getElementById('save-stage-btn');
+    if (saveStageBtn) {
+        saveStageBtn.addEventListener('click', () => {
+            // Find the select element
+            const plantStageSelect = document.getElementById('plant-stage-select');
+            const selectedStage = plantStageSelect.value;
+            
+            if (selectedStage) {
+                // Call the same save function as before
+                handlePlantStageUpdate(selectedStage);
+            } else {
+                alert("Please select a stage first.");
+            }
+        });
+    }
+
     const returnBtn = document.getElementById('return-to-main-map-btn');
     if (returnBtn) {
         returnBtn.addEventListener('click', returnToMainMap);
@@ -1865,6 +2080,7 @@ function setupEventListeners() {
         });
     }
 
+    
     // START Deploying Probes
     // DELETE this block if it appears twice inside setupEventListeners()
 
@@ -2183,6 +2399,9 @@ async function makeAuthenticatedRequest(url, options = {}) {
 /**
  * Initialize analytics chart
  */
+/**
+ * Initialize analytics chart
+ */
 function initializeAnalyticsChart() {
     const ctx = document.getElementById('analytics-chart');
     if (!ctx) return;
@@ -2192,8 +2411,17 @@ function initializeAnalyticsChart() {
     }
 
     analyticsChart = new Chart(ctx, {
-        type: 'line',
-        data: { labels: [], datasets: [{ label: 'Sensor', data: [], borderColor: '#10b981', backgroundColor: 'rgba(16,185,129,0.1)', tension: 0.35, fill: true, pointRadius: 0 }] },
+        type: 'bar', // <-- YEH CHANGE HUA HAI (line se bar)
+        data: { 
+            labels: [], 
+            datasets: [{ 
+                label: 'Sensor', 
+                data: [], 
+                borderColor: '#10b981', // Default, yeh overwrite ho jayega
+                backgroundColor: 'rgba(16,185,129,0.5)', // Default
+                // tension, fill, aur pointRadius hata diye gaye hain
+            }] 
+        },
         options: {
             responsive: true,
             maintainAspectRatio: false,
@@ -2215,8 +2443,9 @@ function initializeAnalyticsChart() {
     if (metricSelect) {
         metricSelect.onchange = () => refreshSensorHistory();
     }
-    refreshSensorHistory();
+    refreshSensorHistory(); // Yeh function ab initial color bhi set kar dega
 }
+
 
 /**
  * Initialize growth chart
@@ -2385,26 +2614,66 @@ async function saveDrawnField() {
     }
 }
 /** Fetch RTDB history and update chart */
+/** Fetch RTDB history and update chart */
+/** Fetch RTDB history and update chart */
 async function refreshSensorHistory() {
+    
+    // User check
+    if (!currentUser) {
+        console.warn("Analytics chart: No user logged in.");
+        if (analyticsChart) {
+            analyticsChart.data.labels = [];
+            analyticsChart.data.datasets[0].data = [];
+            analyticsChart.update();
+        }
+        return;
+    }
+
     try {
-        const res = await fetch('/api/rtdb/sensor-data/history');
-        if (!res.ok) return;
+        const uid = currentUser.uid;
+        const fieldId = 'field_A'; 
+
+        // User ID ke saath fetch karein
+        const res = await fetch(`/api/rtdb/sensor-data/history?userId=${uid}&fieldId=${fieldId}`);
+        
+        if (!res.ok) {
+            console.error("Failed to fetch history for chart", res.status);
+            return;
+        }
+        
         const data = await res.json();
         const readings = data.readings || [];
+        
         const metricPath = document.getElementById('metric-select')?.value || 'environment.humidity';
         const values = readings.map(r => getMetricValue(r, metricPath)).filter(v => typeof v === 'number');
         const labels = readings.map(r => new Date(r.timestamp || Date.now()).toLocaleTimeString());
-        analyticsChart.data.labels = labels;
-        analyticsChart.data.datasets[0].label = metricPath;
-        analyticsChart.data.datasets[0].data = values;
-        analyticsChart.update();
 
-        // Update trend bars for all visible metric cards
+        // --- YEH NAYA BLOCK ADD HUA HAI ---
+        // Metric ke hisaab se color get karein
+        const colors = getMetricColor(metricPath);
+        // --- END NAYA BLOCK ---
+
+        if (analyticsChart) { // Check karein ki chart hai ya nahi
+            analyticsChart.data.labels = labels;
+            analyticsChart.data.datasets[0].label = metricPath;
+            analyticsChart.data.datasets[0].data = values;
+            
+            // --- YEH NAYA BLOCK ADD HUA HAI ---
+            // Chart ke dataset mein colors update karein
+            analyticsChart.data.datasets[0].borderColor = colors.border;
+            analyticsChart.data.datasets[0].backgroundColor = colors.background;
+            // --- END NAYA BLOCK ---
+
+            analyticsChart.update(); 
+        }
+
         updateAllTrendBarsFromHistory(readings);
+
     } catch (e) {
-        console.error('Error loading history', e);
+        console.error('Error loading history for chart', e);
     }
 }
+
 
 function getMetricValue(obj, path) {
     return path.split('.').reduce((acc, key) => (acc && acc[key] !== undefined ? acc[key] : undefined), obj);

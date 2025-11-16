@@ -8,7 +8,7 @@ import os
 import json
 import logging
 import requests
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta ,timezone
 from flask import Flask, request, jsonify, render_template
 from flask_cors import CORS
 from dotenv import load_dotenv
@@ -352,25 +352,35 @@ def get_latest_rtdb_sensor_data():
         if not rtdb:
             return jsonify({"error": "Firebase RTDB not initialized"}), 500
 
-        # CRITICAL CHANGE: Get UID and optional field_id from request arguments
         uid = request.args.get('userId')
-        field_id = request.args.get('fieldId', 'field_A') # Fallback to a default field ID
+        field_id = request.args.get('fieldId', 'field_A') 
         
         if not uid:
              return jsonify({"error": "User ID is required to fetch latest sensor data"}), 400
         
-        # Construct the user-specific path
+        # --- STEP 1: Get the main sensor data (no change here) ---
         path = f'/users/{uid}/live_status/{field_id}'
         ref = rtdb.reference(path)
         snapshot = ref.get()
 
         if snapshot:
             logger.info(f"Fetched data from {path}")
-            # Use timestamp from data if available, otherwise fallback
             timestamp = snapshot.get('timestamp', int(datetime.now().timestamp()))
             reading_id = f"live_{timestamp}"
             normalized_reading = _normalize_reading(reading_id, snapshot)
             
+            # --- THIS IS THE FIX ---
+            # --- STEP 2: Get the crop_stage from its separate path ---
+            try:
+                crop_stage_ref = rtdb.reference(f'/users/{uid}/crop_stage')
+                crop_stage = crop_stage_ref.get()
+                if crop_stage:
+                    # Add it to the JSON response under the key the frontend expects
+                    normalized_reading["plant_stage"] = crop_stage 
+            except Exception as e:
+                logger.warning(f"Could not fetch crop_stage for user {uid}: {e}")
+            # --- END FIX ---
+
             alerts = process_sensor_data(normalized_reading)
             normalized_reading["alerts"] = alerts
             
@@ -579,7 +589,7 @@ def get_user_field():
         id_token = request.headers.get('Authorization').split('Bearer ')[1]
         
         # Verify the token to get the user's UID securely
-        decoded_token = firebase_admin.auth.verify_id_token(id_token)
+        decoded_token = auth.verify_id_token(id_token)
         uid = decoded_token['uid']
         
         db = firestore.client()
@@ -594,7 +604,15 @@ def get_user_field():
         
         if field_doc:
             logger.info(f"Found saved field for user {uid}")
-            return jsonify(field_doc.to_dict())
+            data = field_doc.to_dict()
+            
+            # --- START: UPDATED BLOCK ---
+            # Convert Firestore Timestamp to a string if it exists
+            if 'plantingDate' in data and hasattr(data.get('plantingDate'), 'isoformat'):
+                data['plantingDate'] = data['plantingDate'].isoformat()
+            # --- END: UPDATED BLOCK ---
+                
+            return jsonify(data)
         else:
             logger.info(f"No saved field found for user {uid}")
             return jsonify({}), 404 # Return an empty object if no field is found
@@ -925,6 +943,13 @@ def get_user_fields():
                     field_data['boundary'] = json.loads(field_data['boundary'])
                 except:
                     pass
+            
+            # --- FIX ---
+            # This block converts the Firestore Timestamp to an ISO string
+            if 'plantingDate' in field_data and hasattr(field_data.get('plantingDate'), 'isoformat'):
+                field_data['plantingDate'] = field_data['plantingDate'].isoformat()
+            # --- END FIX ---
+                
             fields.append(field_data)
         
         logger.info(f"Found {len(fields)} fields for user {uid}")
@@ -937,7 +962,51 @@ def get_user_fields():
         logger.error(f"CRITICAL Server Error fetching user fields: {e}", exc_info=True)
         return jsonify({"error": "Internal server error"}), 500
 
+# Add this new route to app.py
 
+@app.route('/api/field/stage', methods=['POST'])
+def update_plant_stage():
+    """
+    Updates the 'crop_stage' directly under the user's UID.
+    """
+    try:
+        if not rtdb or not firebase_admin:
+            return jsonify({"error": "Firebase RTDB not initialized"}), 500
+
+        # 1. Authenticate the user from the token
+        auth_header = request.headers.get('Authorization')
+        if not auth_header or not auth_header.startswith('Bearer '):
+            return jsonify({"error": "No authorization token provided"}), 401
+        
+        id_token = auth_header.split('Bearer ')[1]
+        decoded_token = auth.verify_id_token(id_token)
+        uid = decoded_token['uid']
+
+        # 2. Get data from the request body
+        data = request.get_json()
+        stage = data.get('stage') # We only need the stage
+
+        if not stage:
+            return jsonify({"error": "Missing stage in request"}), 400
+        
+        # --- THIS IS THE FIX ---
+        # 3. Construct the RTDB path to the user's root
+        path = f'/users/{uid}/crop_stage'
+        ref = rtdb.reference(path)
+        
+        # 4. Set the value directly (replaces any existing value)
+        ref.set(stage)
+        # --- END FIX ---
+        
+        logger.info(f"Crop stage updated to '{stage}' for user {uid}")
+        
+        return jsonify({"success": True, "stage": stage})
+
+    except Exception as e:
+        logger.error(f"Error updating plant stage: {e}", exc_info=True)
+        return jsonify({"error": "Internal server error"}), 500
+    
+    
 @app.route('/api/field/delete', methods=['POST'])
 def delete_field():
     """Delete a field document from Firestore by ID."""
@@ -1012,6 +1081,63 @@ def plant_probe_location():
         
     except Exception as e:
         logger.error(f"Error saving probe location to /scans: {e}")
+        return jsonify({"error": "Internal server error"}), 500
+    
+    
+    
+    
+@app.route('/api/user/plant', methods=['POST'])
+def mark_planting_day():
+    """
+    Sets the 'plantingDate' for a specific field to the current time.
+    """
+    try:
+        if not firestore or not firebase_admin:
+            return jsonify({"error": "Firebase not initialized"}), 500
+
+        # 1. Authenticate the user from the token
+        auth_header = request.headers.get('Authorization')
+        if not auth_header or not auth_header.startswith('Bearer '):
+            return jsonify({"error": "No authorization token provided"}), 401
+        
+        id_token = auth_header.split('Bearer ')[1]
+        decoded_token = auth.verify_id_token(id_token)
+        uid = decoded_token['uid']
+
+        # 2. Get fieldId from the request body
+        data = request.get_json()
+        field_id = data.get('fieldId')
+        if not field_id:
+            return jsonify({"error": "Missing fieldId in request"}), 400
+
+        # 3. Get the current time
+        current_time = datetime.now(timezone.utc)
+
+        # 4. Get the database client and document reference
+        db = firestore.client()
+        doc_ref = db.collection('fields').document(field_id)
+        
+        # 5. (Security Check) Verify the user owns this field
+        doc = doc_ref.get()
+        if not doc.exists:
+            return jsonify({"error": "Field not found"}), 404
+        
+        field_data = doc.to_dict()
+        if field_data.get('userId') != uid:
+            return jsonify({"error": "User does not own this field"}), 403 # Forbidden
+
+        # 6. Set the planting date in Firestore
+        doc_ref.update({
+            'plantingDate': current_time
+        })
+        
+        logger.info(f"Planting date set for field {field_id} by user {uid}")
+        
+        # 7. Return the new date so the frontend can display it
+        return jsonify({"success": True, "plantingDate": current_time.isoformat()})
+
+    except Exception as e:
+        logger.error(f"Error marking planting day: {e}", exc_info=True)
         return jsonify({"error": "Internal server error"}), 500
     
 
